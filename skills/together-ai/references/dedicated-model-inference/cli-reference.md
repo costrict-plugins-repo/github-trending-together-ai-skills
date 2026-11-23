@@ -1,0 +1,308 @@
+# Dedicated Model Inference — CLI Reference
+
+The Together CLI is the fastest path for DMI. It's intent-based: each command expresses a goal
+and wires up the underlying resources.
+
+## Contents
+
+- [Installation and invocation](#installation-and-invocation)
+- [Command tree](#command-tree)
+- [endpoints deploy](#endpoints-deploy)
+- [endpoints ls / get](#endpoints-ls--get)
+- [endpoints update](#endpoints-update)
+- [endpoints rm (smart delete)](#endpoints-rm-smart-delete)
+- [endpoints ab (A/B tests)](#endpoints-ab-ab-tests)
+- [endpoints shadow (shadow experiments)](#endpoints-shadow-shadow-experiments)
+- [models commands](#models-commands)
+- [What the CLI can't do](#what-the-cli-cant-do)
+
+## Installation and invocation
+
+```bash
+uv tool install "together[cli]>=3"
+tg --version                      # check (this skill targets 3.x); upgrade with: uv tool upgrade together
+```
+
+`tg` and `together` are interchangeable entry points (docs use `tg`). Project scoping: the CLI
+uses the project associated with your API key, overridable with the `TOGETHER_PROJECT_ID` env
+var or `--project` on any command. Every command accepts `--json` for machine-readable output.
+
+**Scripting / non-interactive use (agents, CI, piped stdin).** Mutating commands such as
+`deploy` print a confirmation preview and prompt before acting; with no TTY they can't read the
+prompt and fail. Pass `--non-interactive` to skip the prompt. In that mode project inference
+from the API key is *not* applied — `deploy` errors with `Project argument is required` unless
+you also pass `--project <proj_...>` (or set `TOGETHER_PROJECT_ID`). A reliable scripted deploy
+is therefore `tg endpoints deploy ... --project <proj_id> --non-interactive --json`.
+
+## Command tree
+
+```text
+tg endpoints
+  deploy     Deploy a model: create endpoint + deployment + route traffic in one step
+  ls         List endpoints in the project
+  get        Get endpoint details (also the default command: tg endpoints ep_abc123)
+  update     Update a deployment: replica bounds, scaling metrics, traffic weight
+  rm         Smart-delete any endpoint/deployment/experiment/rollout by ID prefix
+  events     List an endpoint's audit and lifecycle events
+  ab         Start an A/B test (creates the variant deployment)
+  shadow     Start a shadow experiment (creates the shadow deployment)
+  rollout    Roll a deployment onto live traffic (rolling, blue-green, canary); see --help
+
+tg models
+  public          List platform-supported public models (the deployable catalog)
+  list | ls       List models in your project (uploaded/fine-tuned)
+  get <id>        Get a model
+  configs <id>    List published configs for a model
+  create          Register a custom model/adapter record
+  upload          Upload local weights to a model record
+  ls-files        List files in a model or adapter
+  ls-revisions    List revisions for a model
+  download        Download model/adapter files to a local directory
+  update / rm     Update or delete a model record (rm was previously `delete`)
+  remote-uploads  create | retrieve | list  (import from Hugging Face or presigned URL)
+```
+
+## endpoints deploy
+
+Creates (or reuses) an endpoint, attaches a new deployment, and routes 100% of traffic to it.
+Returns as soon as resources are created; the deployment provisions in the background.
+
+```bash
+tg endpoints deploy <model> --endpoint <name-or-id> [flags]
+```
+
+`<model>` (positional) accepts a model ID (`ml_...`) or a model name (public catalog name or a
+model in your project). `--endpoint` takes a new name (creates the endpoint) or an existing
+name/ID (adds a deployment to it).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--config` | auto | Config ID (`cr_...`). Auto-selected when the model has exactly one; use `tg models configs <model_id>` to list. |
+| `--deployment-name` | derived | Deployment name; defaults to model name + short suffix. |
+| `--min-replicas` / `--max-replicas` | 1 / 1 | Replica bounds. Pass a range (e.g. 1/10) to autoscale. |
+| `--scale-up-window` | — | Seconds the metric must stay above target before adding replicas. |
+| `--scale-down-window` | — | Cooldown seconds between scale-downs. |
+| `--model-revision` | latest | Deprecated. Model revision ID (`rv_...`) to pin. Prefer a model resource path ending in `/revisions/<rv_id>` as the positional. |
+| `--scaling-metric` / `--scaling-target` / `--scaling-percentile` | — | Autoscale on one metric (pair with a `--min`/`--max` range): metric name + target, optional percentile (`p50`/`p90`/`p95`/`p99`, latency metrics only). The CLI takes a single metric as flat flags — the JSON `scaling_metrics` array is SDK/API-only. |
+| `--placement` | — | Placement profile ID to use. |
+| `--placement.regions` | — | Comma-separated inline placement regions (mutually exclusive with `--placement`). |
+| `--placement.constraint` | — | `required` or `preferred` — how strictly to enforce inline placement regions. |
+| `--placement.hipaa` | off | Require HIPAA-eligible placement. |
+| `--inactive-timeout` | off | Minutes without requests before the deployment stops itself: `0` (off) or `30` to `1440`. |
+| `--max-concurrent-requests-per-replica` | platform default | Maximum in-flight inference requests per replica. `0` means unlimited when the config limit is 1 or less. |
+| `--traffic-weight` | — | Capacity weight for this deployment in the endpoint's traffic split, set at deploy time. Other deployments keep their weights. `0` deploys it with no live traffic. |
+| `--merge` | off | LoRA adapter models only. Creates a new deployment that serves the adapter merged into its base model. An adapter needs this or `--attach-adapter`. |
+| `--attach-adapter` | off | LoRA adapter models only. Attaches the adapter to a base-model deployment whose config has adapter mode dynamic or fixed, creating that deployment when none exists. An adapter needs this or `--merge`. |
+
+Without `--inactive-timeout`, a deployment runs and bills until you stop it. 30 minutes is the
+shortest idle timeout, and a value from 1 to 29 is rejected with HTTP 400. When a task asks for
+less than 30, pass `30`, say it is the minimum, and verify the shutdown at that value.
+
+```bash
+# Deploy a public model, single replica
+tg endpoints deploy ml_CbJNwQC2ZqCU2iFT3mrCh --endpoint my-endpoint
+
+# Explicit config, autoscaling 1-10
+tg endpoints deploy ml_CbJNwQC2ZqCU2iFT3mrCh \
+  --endpoint my-endpoint \
+  --config cr_CbzGdmn14t3HYrXXitmKa \
+  --min-replicas 1 --max-replicas 10
+```
+
+Output includes the endpoint ID (`ep_...`), deployment ID (`dep_...`), and the **endpoint
+string** (`your-project-slug/my-endpoint`, labeled "Endpoint string" in `get` output) — the
+value for the inference `model` parameter. First-time provisioning commonly takes up to ~20 minutes while
+weights download and hardware is allocated.
+
+## endpoints ls / get
+
+```bash
+tg endpoints ls [--limit N] [--after CURSOR] [--org]
+tg endpoints get ep_abc123    # endpoint detail: split + each deployment's state/replicas
+tg endpoints get dep_abc123   # deployment detail (parent endpoint resolved automatically)
+
+# Machine-readable deployment state for polling loops
+tg endpoints get dep_abc123 --json | jq -r '.status.state'
+```
+
+`get` accepts an endpoint **or** deployment ID. Re-running it is a quick way to poll a
+deployment as it comes up. Passing an ID with no subcommand (`tg endpoints ep_abc123`)
+runs `get`. For deployment lists with `filter`/`order_by`, use the SDK/API — see
+[api-reference.md](api-reference.md).
+
+## endpoints update
+
+Updates a **deployment's** parameters. Pass the deployment ID (`dep_...`); the CLI resolves
+its parent endpoint automatically. At least one option is required.
+
+```bash
+# Scale replica bounds
+tg endpoints update dep_abc123 --min-replicas 2 --max-replicas 4
+
+# Stop (scale to zero; billing stops) / restart
+tg endpoints update dep_abc123 --min-replicas 0 --max-replicas 0
+tg endpoints update dep_abc123 --min-replicas 1 --max-replicas 2
+
+# Scale on a specific metric (one metric, flat flags — not the SDK/API JSON array)
+tg endpoints update dep_abc123 --min-replicas 1 --max-replicas 4 \
+  --scaling-metric gpu_utilization --scaling-target 70
+
+# Set this deployment's traffic weight (preserves the other deployments' weights)
+tg endpoints update dep_abc123 --traffic-weight 30
+
+# Take it out of rotation without scaling it down
+tg endpoints update dep_abc123 --traffic-weight 0
+```
+
+| Flag | Description |
+| --- | --- |
+| `--min-replicas` / `--max-replicas` | Updated replica bounds. |
+| `--scale-up-window` / `--scale-down-window` | Autoscaling stabilization windows. |
+| `--inactive-timeout` | Minutes without requests before the deployment stops itself: `0` (off) or `30` to `1440`. Changing it restarts the idle clock. |
+| `--scaling-metric` / `--scaling-target` / `--scaling-percentile` | Autoscale on one metric: metric name + target, plus an optional percentile (`p50`/`p90`/`p95`/`p99`, latency metrics only). The CLI takes a single metric this way; the JSON `scaling_metrics` array is SDK/API-only (see api-reference.md, Scaling Metrics). |
+| `--traffic-weight` | Capacity weight in the endpoint's traffic split. Upserts just this deployment's entry; `0` stops routing to it. |
+| `--ab-percent` | A/B traffic percent for this variant deployment. Takes from or returns to the control only. |
+| `--max-concurrent-requests-per-replica` | Updated maximum in-flight inference requests per replica. `0` means unlimited when the config limit is 1 or less. |
+| `--etag` | ETag for optimistic concurrency. Does not apply to `--ab-percent` or `--traffic-weight`. |
+
+Notes:
+
+- `--traffic-weight` edits one deployment's split entry. Replacing the whole split at once is
+  still an SDK/API operation (`endpoints.update(traffic_split=[...])`).
+- To stop an idle deployment by hand, set `--min-replicas 0 --max-replicas 0`; to have it stop
+  itself, set `--inactive-timeout`. A deployment with an inactivity timeout cannot take part in
+  a rollout.
+
+## endpoints rm (smart delete)
+
+Resolves the resource by ID prefix and deletes it: endpoint (`ep_`), deployment (`dep_`), A/B
+experiment (`abx_`), shadow experiment (`exp_`).
+
+```bash
+tg endpoints rm dep_abc123          # delete a deployment (must be STOPPED)
+tg endpoints rm ep_abc123           # delete an endpoint with no deployments
+tg endpoints rm ep_abc123 --force   # scale deployments to 0/0 and tear everything down
+tg endpoints rm abx_abc123          # end an A/B test (traffic returns to control)
+tg endpoints rm exp_abc123          # stop a shadow experiment
+```
+
+Deleting a deployment auto-detaches it from the traffic split and any experiments. Running
+deployments: `rm dep_...` on a running deployment scales it to `0/0` for you and asks you to
+retry once it reaches `STOPPED` (the delete itself still requires a stopped deployment);
+`rm ep_... --force` scales the endpoint's deployments down itself as part of teardown. `rm`
+smart-deletes endpoints, deployments, experiments, adapter attachments (`dad_`), and rollouts (`rol_`).
+
+## endpoints ab (A/B tests)
+
+Creates a variant deployment for a model and starts an A/B experiment against a control
+deployment that's already serving traffic. The CLI assigns the remainder to the control.
+
+```bash
+tg endpoints ab Qwen/Qwen2.5-7B-Instruct \
+  --control dep_control123 \
+  --percent 5 \
+  --name sampling-tweak-v1
+```
+
+The variant model is the positional argument (same forms as `deploy`). For a **public catalog
+model, pass the name** (as above), not the `ml_` ID echoed by `deploy`/`models public` — that
+ID is owned by a platform project and the positional resolves it in *your* project, failing
+with `Model ml_… not found`. Use the `ml_` ID only for a model that lives in your own project.
+
+| Flag | Description |
+| --- | --- |
+| `--control` | Control deployment ID currently serving live traffic. Required. |
+| `--percent` | Traffic percent for the variant, integer 1–99. Required. |
+| `--config` | Config for the variant (auto-selected like `deploy`). |
+| `--name` | Variant deployment name (defaults to model name + suffix). |
+
+To ramp one variant, run `tg endpoints update <variant_dep_id> --ab-percent N`. Replacing the
+whole member set is SDK/API only (`ab_experiments.update` requires `update_mask="members"` + the
+current `etag` or it 400s — see [traffic-routing.md](traffic-routing.md)). End the test with
+`rm abx_...`.
+
+## endpoints shadow (shadow experiments)
+
+Creates a shadow deployment from a model and mirrors a sampled fraction of live endpoint
+traffic to it. Responses from the shadow are measured and discarded — callers never see them.
+
+```bash
+# Uniform 10% mirror
+tg endpoints shadow --endpoint ep_abc123 \
+  --model ml_CbJNwQC2ZqCU2iFT3mrCh --rate 0.1 --name candidate-v2
+
+# Sticky per-user sampling
+tg endpoints shadow --endpoint ep_abc123 \
+  --model ml_CbJNwQC2ZqCU2iFT3mrCh --rate 0.05 --key body.user --name candidate-v2
+
+# Adaptive: throttle toward ~5 QPS
+tg endpoints shadow --endpoint ep_abc123 \
+  --model ml_CbJNwQC2ZqCU2iFT3mrCh --target-qps 5.0 --name candidate-v2
+```
+
+| Flag | Description |
+| --- | --- |
+| `--endpoint` | Endpoint serving the live traffic to mirror — accepts an ID or a name. |
+| `--model` / `--config` | Model (and optional config) for the shadow deployment. |
+| `--rate` | Fraction of traffic to mirror, 0.0–1.0 (uniform / key_based). |
+| `--key` | Request-body field for sticky sampling (e.g. `body.user`). |
+| `--target-qps` | Target mirrored QPS (adaptive strategies; approximate throttle). |
+| `--window` | Sliding window for adaptive QPS observation (default 60s). |
+| `--name` | Shadow deployment name. |
+
+Pass `--rate` or `--target-qps` (one is required). Stop with `rm exp_...`.
+
+## models commands
+
+```bash
+# Browse the deployable public catalog
+tg models public --product dedicated
+tg models public --modality text --search qwen
+
+# List configs published for a model (hardware, GPU count, optimization)
+tg models configs ml_CbJNwQC2ZqCU2iFT3mrCh
+
+# Register a custom model or adapter record (name it bare, no org prefix)
+tg models create gemma-4-31b-it --base-model ml_CbJNwQC2ZqCU2iFT3mrCh
+
+# Upload local weights (same command for a model or a LoRA adapter record)
+tg models upload ml_abc123 ./path/to/model-dir
+tg models upload ml_abc123 ./path/to/adapter-dir
+
+# Import from Hugging Face or a presigned S3 URL (server-side streaming)
+tg models remote-uploads create ml_abc123 \
+  --from https://huggingface.co/your-org/your-repo --token hf_your_token
+tg models remote-uploads retrieve job_abc123
+tg models remote-uploads list
+
+# Inspect your project's models
+tg models list
+tg models ls-files ml_abc123
+tg models ls-revisions ml_abc123
+
+# Download files back to your machine (--format hf = HuggingFace snapshot layout)
+tg models download ml_abc123 ./local-dir [--revision rv_...] [--format hf]
+
+# Delete a model record (metadata only; renamed from `delete`)
+tg models rm ml_abc123
+```
+
+Only `models create` takes `--type` (`model` or `adapter`, default `model`). The record's type is
+fixed there, so `upload`, `remote-uploads`, and `ls-files` take no type flag. `--product` and
+`--modality` values on `models public` are lowercase.
+
+Full upload flows (requirements, S3 archive format, polling, deploying the result) are in
+[models-and-configs.md](models-and-configs.md).
+
+## What the CLI can't do
+
+These are SDK/API-only operations; don't hunt for CLI flags:
+
+- Replace an endpoint's traffic split in one call (`update --traffic-weight` upserts one
+  deployment at a time; the full-split write is `endpoints.update(traffic_split=[...])`).
+- List deployments or use `filter` / `order_by` (though `get` reads a single deployment and
+  shows every deployment's state on the endpoint view).
+- Replace an A/B experiment's whole member set (`update --ab-percent` ramps one variant), or
+  update a shadow experiment's sampling.
+- Inference itself — point curl or an OpenAI client at `https://api-inference.together.ai/v1`, or
+  the Together SDK 3.x at `https://api-inference.together.ai` (its default for chat completions).
